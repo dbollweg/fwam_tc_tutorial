@@ -1,4 +1,5 @@
 import argparse
+from pathlib import Path
 
 import torch
 import triton
@@ -107,6 +108,32 @@ def compute_error(name, result, reference):
     relative_error = torch.linalg.vector_norm(delta)/torch.linalg.vector_norm(reference)
     print(f"{name}: relative Error = {relative_error:.3e}")
 
+def kernel_launch_and_dump_ptx(B, A, C, *, ptx_dir=None):
+    N, K = A.shape
+    M, _ = B.shape
+    Y = torch.empty((M,K), device=A.device, dtype=torch.float32)
+
+    #round to nearest multiple of Tensor Core instruction K size
+    BK = max(16, triton.next_power_of_2(K))
+
+    #1D program grid along M with a single program covering BM rows
+    grid = lambda META: (triton.cdiv(M, META["BM"]),)
+
+    #kernel launch
+    compiled = triton_kernel[grid](
+        Y, B, A, C,
+        N=N, M=M, K=K,
+        BK=BK,
+    )
+    if ptx_dir is not None:
+        ptx_dir = Path(ptx_dir)
+        ptx_dir.mkdir(parents=True, exist_ok=True)
+        ptx_path = ptx_dir / f"triton_kernel_M{M}_N{N}_K{K}.ptx"
+        ptx_path.write_text(compiled.asm["ptx"], encoding="utf-8")
+        print(f"Saved PTX: {ptx_path}")
+        print(f"Tuned config: {triton_kernel.best_config}")
+    return Y
+
 def main():
     parser = argparse.ArgumentParser(
         description="Benchmark implementations of relu(B @ A.T) @ C."
@@ -122,6 +149,8 @@ def main():
                         help="warm-up iterations per implementation (default: %(default)s)")
     parser.add_argument("--iterations", "--iters", type=int, default=100,
                         help="timed iterations per implementation (default: %(default)s)")
+    parser.add_argument("--save-ptx", type=Path, metavar="DIR",
+                        help="save the tuned Triton kernel's PTX for each shape in DIR")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -154,6 +183,8 @@ def main():
             for name, fn in implementations:
                 compute_error(name, fn(), expected)
             run_benchmark(args, K, implementations)
+            if args.save_ptx is not None:
+                kernel_launch_and_dump_ptx(B_bf16, A_bf16, C_bf16, ptx_dir=args.save_ptx)
 
 if __name__ == "__main__":
     main()
