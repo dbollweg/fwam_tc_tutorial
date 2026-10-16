@@ -20,8 +20,7 @@ import triton.language as tl
 )
 @triton.jit
 def triton_kernel(
-    Y_ptr, B_ptr, A_ptr, C_ptr,
-    M, N, K,
+    Y_ptr, B_ptr, A_ptr, C_ptr, M, N, K,
     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -48,14 +47,18 @@ def triton_kernel(
 
     tl.store(Y_ptr + offsets_m, y, mask=mask_m)
 
-def triton_launch(B, A, C):
+def kernel_launch(B, A, C):
     N, K = A.shape
     M, _ = B.shape
     Y = torch.empty((M,K), device=A.device, dtype=torch.float32)
 
+    #round to nearest multiple of Tensor Core instruction K size
     BK = max(16, triton.next_power_of_2(K))
 
+    #1D program grid along M with a single program covering BM rows
     grid = lambda META: (triton.cdiv(M, META["BM"]),)
+
+    #kernel launch
     triton_kernel[grid](
         Y, B, A, C,
         N=N, M=M, K=K,
@@ -145,7 +148,7 @@ def main():
             implementations = [
                 ("PyTorch", lambda: reference_eager(B, A, C)),
                 ("PyTorch (compiled)", lambda: reference_compiled(B, A, C)),
-                ("Triton", lambda: triton_launch(B_bf16, A_bf16, C_bf16)),
+                ("Triton", lambda: kernel_launch(B_bf16, A_bf16, C_bf16)),
             ]
             expected = reference_eager(B.double(), A.double(), C.double())
             for name, fn in implementations:
