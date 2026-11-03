@@ -1,9 +1,15 @@
 import argparse
+import time
+from functools import partial
 from pathlib import Path
 
 import torch
 import triton
 import triton.language as tl
+
+from triton_kernel_bf16_stream_N import (
+    kernel_launch as kernel_launch_stream_n,
+)
 
 @triton.autotune(
         configs=[
@@ -48,67 +54,7 @@ def triton_kernel(
 
     tl.store(Y_ptr + offsets_m, y, mask=mask_m)
 
-def kernel_launch(B, A, C):
-    N, K = A.shape
-    M, _ = B.shape
-    Y = torch.empty((M,K), device=A.device, dtype=torch.float32)
-
-    #round to nearest multiple of Tensor Core instruction K size
-    BK = max(16, triton.next_power_of_2(K))
-
-    #1D program grid along M with a single program covering BM rows
-    grid = lambda META: (triton.cdiv(M, META["BM"]),)
-
-    #kernel launch
-    triton_kernel[grid](
-        Y, B, A, C,
-        N=N, M=M, K=K,
-        BK=BK,
-    )
-    return Y
-
-def reference_eager(B: torch.Tensor, A: torch.Tensor, C: torch.Tensor):
-    return torch.relu(B @ A.T) @ C
-
-reference_compiled = torch.compile(reference_eager, mode="max-autotune-no-cudagraphs")
-
-def ms_to_tflops(M, N, D, ms):
-    flops = M * N * (2 * D - 1) + M * D * (2 * N - 1)
-
-    s = ms * 1e-3
-    return flops / s / 1e12
-
-def benchmark(fn, warmup, iterations):
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iterations):
-        fn()
-    end.record()
-    end.synchronize()
-    return start.elapsed_time(end) / iterations
-
-def run_benchmark(args, K, implementations):
-    M, N = args.M, args.N
-    results = {}
-    name_width = max(24, max(len(name) for name, _ in implementations))
-    print(f"{'Implementation':<{name_width}} {'Average (ms)':>14} {'TFLOP/s':>14}")
-    for name, fn in implementations:
-        ms = benchmark(fn, args.warmup, args.iterations)
-        results[name] = ms
-        print(f"{name:<{name_width}} {ms:>14.4f} {ms_to_tflops(M, N, K, ms):>14.4f}")
-
-
-def compute_error(name, result, reference):
-    delta = result - reference
-    relative_error = torch.linalg.vector_norm(delta)/torch.linalg.vector_norm(reference)
-    print(f"{name}: relative Error = {relative_error:.3e}")
-
-def kernel_launch_and_dump_ptx(B, A, C, *, ptx_dir=None):
+def kernel_launch(B, A, C, *, ptx_dir=None, sass_dir=None):
     N, K = A.shape
     M, _ = B.shape
     Y = torch.empty((M,K), device=A.device, dtype=torch.float32)
@@ -125,14 +71,90 @@ def kernel_launch_and_dump_ptx(B, A, C, *, ptx_dir=None):
         N=N, M=M, K=K,
         BK=BK,
     )
-    if ptx_dir is not None:
-        ptx_dir = Path(ptx_dir)
-        ptx_dir.mkdir(parents=True, exist_ok=True)
-        ptx_path = ptx_dir / f"triton_kernel_M{M}_N{N}_K{K}.ptx"
-        ptx_path.write_text(compiled.asm["ptx"], encoding="utf-8")
-        print(f"Saved PTX: {ptx_path}")
+    if ptx_dir is not None or sass_dir is not None:
+        for fmt, directory in (("ptx", ptx_dir), ("sass", sass_dir)):
+            if directory is None:
+                continue
+            directory = Path(directory)
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / f"triton_kernel_K{K}.{fmt}"
+            path.write_text(compiled.asm[fmt], encoding="utf-8")
+            print(f"Saved {fmt.upper()}: {path}")
         print(f"Tuned config: {triton_kernel.best_config}")
     return Y
+
+
+def triton_kernel_candidates(B, A, C):
+    return [
+        ("Triton (baseline)", partial(kernel_launch, B, A, C)),
+        ("Triton (Stream-N)", partial(kernel_launch_stream_n, B, A, C,
+                                      fuse_relu=False, keep_b_in_registers=False)),
+        ("Triton (Stream-N + ReLU)", partial(kernel_launch_stream_n, B, A, C,
+                                             fuse_relu=True, keep_b_in_registers=False)),
+        ("Triton (Stream-N + ReLU + B regs)", partial(kernel_launch_stream_n, B, A, C,
+                                                      fuse_relu=True, keep_b_in_registers=True)),
+    ]
+
+def reference_eager(B: torch.Tensor, A: torch.Tensor, C: torch.Tensor):
+    return torch.relu(B @ A.T) @ C
+
+reference_compiled = torch.compile(reference_eager, mode="max-autotune-no-cudagraphs")
+
+def ms_to_tflops(M, N, D, ms):
+    flops = M * N * (2 * D - 1) + M * D * (2 * N - 1)
+
+    s = ms * 1e-3
+    return flops / s / 1e12
+
+def make_rotating_calls(fn, l2_cache_bytes):
+    input_bytes = sum(t.numel() * t.element_size() for t in fn.args)
+    target_bytes = 3 * l2_cache_bytes
+    num_groups = 1 if input_bytes >= target_bytes else target_bytes // input_bytes + 1
+
+    calls = [fn]
+    for _ in range(1, num_groups):
+        inputs = tuple(t.clone() for t in fn.args)
+        calls.append(partial(fn.func, *inputs, **fn.keywords))
+    return calls
+
+# Benchmarking is an art - we will follow the kernel benchmarking recommendations from the hazy research group, see:
+# "ThunderKittens 2.0: Even Faster Kernels for Your GPUs"
+# https://hazyresearch.stanford.edu/blog/2026-02-19-tk-2#benchmarking-gpu-kernels-properly
+# Specifically, we use 500 warmup iterations before starting profiling,
+# we run 100 profiling iterations with 2 cuda events encompassing the 100 iterations,
+# we let the GPU idle for a while between timing different implementations,
+# and lastly, we use rotating inputs that cause L2 cache eviction in between kernel calls.
+def benchmark(calls, warmup=500, iterations=100, cooldown_ms=500):
+    calls[0]()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    for i in range(warmup):
+        calls[i % len(calls)]()
+
+    start.record()
+    for i in range(warmup, warmup + iterations):
+        calls[i % len(calls)]()
+    end.record()
+    end.synchronize()
+    ms = start.elapsed_time(end) / iterations
+    time.sleep(cooldown_ms / 1000)
+    return ms
+
+def run_benchmark(args, K, implementations):
+    M, N = args.M, args.N
+    name_width = max(24, max(len(name) for name, _ in implementations))
+    print(f"{'Implementation':<{name_width}} {'Average (ms)':>14} {'TFLOP/s':>14}")
+    for name, fn in implementations:
+        calls = make_rotating_calls(fn, args.l2_cache_bytes)
+        ms = benchmark(calls, args.warmup, args.iterations, args.cooldown_ms)
+        print(f"{name:<{name_width}} {ms:>14.4f} {ms_to_tflops(M, N, K, ms):>14.4f}")
+
+
+def compute_error(name, result, reference):
+    delta = result - reference
+    relative_error = torch.linalg.vector_norm(delta)/torch.linalg.vector_norm(reference)
+    print(f"{name}: relative Error = {relative_error:.3e}")
 
 def main():
     parser = argparse.ArgumentParser(
@@ -145,13 +167,28 @@ def main():
     parser.add_argument("--K", type=int, nargs="+",
                         default=[16, 32, 64, 128],
                         help="number of columns in B (default: %(default)s)")
-    parser.add_argument("--warmup", "--warmup-iters", type=int, default=10,
-                        help="warm-up iterations per implementation (default: %(default)s)")
+    parser.add_argument("--cooldown-ms", type=float, default=500,
+                        help="GPU idle time after each implementation "
+                             "(ms; default: %(default)s)")
+    parser.add_argument("--warmup", "--warmup-iters", type=int, default=500,
+                        help="warm-up iterations per implementation "
+                             "(default: %(default)s)")
     parser.add_argument("--iterations", "--iters", type=int, default=100,
-                        help="timed iterations per implementation (default: %(default)s)")
-    parser.add_argument("--save-ptx", type=Path, metavar="DIR",
-                        help="save the tuned Triton kernel's PTX for each shape in DIR")
+                        help="timed iterations per implementation "
+                             "(default: %(default)s)")
+    parser.add_argument("--ptx-dir", type=Path, metavar="DIR",
+                        help="save each tuned Triton kernel's PTX in DIR")
+    parser.add_argument("--sass-dir", type=Path, metavar="DIR",
+                        help="save each tuned Triton kernel's SASS in DIR")
+
     args = parser.parse_args()
+
+    if args.M <= 0 or args.N <= 0 or any(K <= 0 for K in args.K):
+        parser.error("M, N, and K must be positive")
+    if args.warmup < 0 or args.iterations <= 0:
+        parser.error("warmup must be nonnegative and iterations must be positive")
+    if args.cooldown_ms < 0:
+        parser.error("cooldown-ms must be nonnegative")
 
     if not torch.cuda.is_available():
         parser.error("a CUDA-enabled GPU is required")
@@ -160,6 +197,9 @@ def main():
     torch.manual_seed(0)
 
     major, minor = torch.cuda.get_device_capability()
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    args.l2_cache_bytes = getattr(properties, "L2_cache_size", 0)
+    
     print(f"GPU: {torch.cuda.get_device_name()} (SM{major}{minor})")
 
     for K in args.K:
@@ -174,17 +214,21 @@ def main():
         C_bf16 = C.to(torch.bfloat16)
 
         with torch.inference_mode():
+            candidates = triton_kernel_candidates(B_bf16, A_bf16, C_bf16)
             implementations = [
-                ("PyTorch", lambda: reference_eager(B, A, C)),
-                ("PyTorch (compiled)", lambda: reference_compiled(B, A, C)),
-                ("Triton", lambda: kernel_launch(B_bf16, A_bf16, C_bf16)),
-            ]
-            expected = reference_eager(B.double(), A.double(), C.double())
-            for name, fn in implementations:
-                compute_error(name, fn(), expected)
+                ("PyTorch", partial(reference_eager, B, A, C)),
+                ("PyTorch (compiled)", partial(reference_compiled, B, A, C)),
+            ] + candidates
+
+            # expected = reference_eager(B.double(), A.double(), C.double())
+            # for name, fn in implementations:
+            #     compute_error(name, fn(), expected)
+
             run_benchmark(args, K, implementations)
-            if args.save_ptx is not None:
-                kernel_launch_and_dump_ptx(B_bf16, A_bf16, C_bf16, ptx_dir=args.save_ptx)
+            if args.ptx_dir is not None or args.sass_dir is not None:
+                for _, fn in candidates:
+                    fn(ptx_dir=args.ptx_dir, sass_dir=args.sass_dir)
+
 
 if __name__ == "__main__":
     main()
