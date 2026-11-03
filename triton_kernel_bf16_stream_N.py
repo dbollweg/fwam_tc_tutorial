@@ -28,6 +28,13 @@ from triton.runtime.jit import KernelInterface
 # and increment an atomic counter. The last thread-block to arrive adds them up
 # and writes the result.
 
+# You can find a diagram depicting this scheduling idea in figures/stream_n_schedule.png.
+
+# We can also measure and visualize the tail effect in our kernel variants by 
+# using nsight-compute's PM sampling and looking at Tensor Core utilization over the kernel's runtime. 
+# You can find a plot of the sampled data for the baseline and Stream-N kernel variants on an RTX Pro 6000 Blackwell GPU in figures/pm_sampling_K16.png.
+
+# There are two more tiny optimizations in the code below related to Triton code generation, see lines 177 and 187 for details.
 
 def stream_n_schedule(num_tiles, n_blocks, partition_size):
     remainder = num_tiles % partition_size
