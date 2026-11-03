@@ -4,7 +4,7 @@ This repo contains the Triton benchmark and kernel code from my talk "Tensor Cor
 The example used in that talk to give an introduction to Tensor Core programming is the following computation:
 
 $$
-Y = \operatorname{ReLU}\left(B A^{\mathsf{T}}\right) C
+Y = \mathrm{ReLU}\left(B A^{\mathsf{T}}\right) C
 $$
 
 with tall-and-skinny matrices $B \in \mathbb{R}^{M \times K}$ and $A, C \in \mathbb{R}^{N \times K}$, where $M = 250000$, $N = 2500$, and $K = 16$.
