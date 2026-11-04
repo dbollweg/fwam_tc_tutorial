@@ -66,18 +66,75 @@ y += tl.dot(s, c, out_dtype=tl.float32)
 
 We see a long section of `mma.sync` instructions corresponding to the first `tl.dot`, followed by a pattern of 2 `max` and one `cvt.rn` instruction. This is followed by the `mma.sync` instructions of our second `tl.dot` call. PTXAS interleaves these three phases to the best of its ability, but we still have to perform a lot of `FMNMX` instructions in between mma instructions which may be holding us back. To check this yourself, use the `--ptx-dir` and `--sass-dir` options which dump the kernel code for you to read.
 
-Reading nvidia's PTX documentation for the `cvt` instruction, you may stumble upon the `{.relu}` modifier. This lets us create this gem: `cvt.rn.relu.bf16x2.f32`. It converts two FP32 values to BF16 and applies ReLU in the same instruction, which previously took as three! Replacing the tl.maximum call with inline PTX
+Reading nvidia's PTX documentation for the `cvt` instruction, you may stumble upon the `{.relu}` modifier. This lets us create this gem: `cvt.rn.relu.bf16x2.f32`. It converts two FP32 values to BF16 and applies ReLU in the same instruction, which previously took us three instructions! Replacing the `tl.maximum` call with inline PTX
+
 ```python
 s = tl.inline_asm_elementwise(
-                    "cvt.rn.relu.bf16x2.f32 $0, $2, $1;",
-                    constraints="=r,f,f", args=[s],
-                    dtype=tl.bfloat16, is_pure=True, pack=2,
-                )
+    "cvt.rn.relu.bf16x2.f32 $0, $2, $1;",
+    constraints="=r,f,f", args=[s],
+    dtype=tl.bfloat16, is_pure=True, pack=2,
+)
 ```
+
 gives us the following improvement:
+
 | Implementation | Average (ms) | TFLOP/s |
 | :--- | ---: | ---: |
 | Triton (Stream-N + ReLU) | 0.0931 | 422.8930 |
+
+We can also get this fusion in SASS by explicitly enabling NaN propagation:
+
+```python
+s = tl.maximum(s, 0.0, propagate_nan=tl.PropagateNan.ALL).to(
+    tl.bfloat16, fp_downcast_rounding="rtne"
+)
+```
+
+By default, `tl.maximum(NaN, 0.0)` returns zero, while `cvt.rn.relu` preserves NaNs. Setting `propagate_nan=tl.PropagateNan.ALL` makes these match. Triton still emits separate maximum and conversion instructions in PTX, but PTXAS can combine them into `F2FP.RELU.BF16.F32.PACK_AB` in SASS. We keep the inline PTX here to request the fused operation explicitly instead of relying on PTXAS.
+
+### Keeping B in registers
+
+Lastly, we notice that the B tile, which is re-used across an entire N loop, ends up being reloaded from shared memory repeatedly. In the Stream-N + ReLU PTX dump for K = 16, these four `ldmatrix` instructions sit inside the N loop. Here is the relevant excerpt, with unrelated instructions omitted:
+
+```ptx
+$L__BB0_7: // Inner N loop
+    // ... pipeline bookkeeping and loads of the current A and C tiles ...
+    // Reload the same B tile from shared memory on every iteration.
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r217, %r218, %r219, %r220}, [%r22];
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r269, %r270, %r271, %r272}, [%r23];
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r305, %r306, %r307, %r308}, [%r24];
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r341, %r342, %r343, %r344}, [%r25];
+    // ... initialize the accumulators ...
+    mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32
+        {%r213, %r214, %r215, %r216}, {%r217, %r218, %r219, %r220},
+        {%r221, %r222}, {%r213, %r214, %r215, %r216};
+    // ... remaining matrix operations, prefetching, and loop bookkeeping ...
+    @%p17 bra $L__BB0_7;
+```
+
+We can force B to stay in registers by adding an artificial loop-carried dependency after the second `tl.dot`:
+
+```python
+b = tl.inline_asm_elementwise(
+    "mov.b16 $0, $1;", constraints="=h,h,f", args=[b, y],
+    dtype=tl.bfloat16, is_pure=True, pack=1,
+)
+```
+
+With this change, the B tile is loaded into registers before the N loop and reused across its iterations. This only gives a minor improvement, and we end up with the following:
+
+| Implementation | Average (ms) | TFLOP/s |
+| :--- | ---: | ---: |
+| PyTorch | 6.6268 | 5.9411 |
+| PyTorch (compiled) | 3.4488 | 11.4160 |
+| Triton (baseline) | 0.1100 | 357.9578 |
+| Triton (Stream-N) | 0.0983 | 400.5142 |
+| Triton (Stream-N + ReLU) | 0.0931 | 422.8930 |
+| Triton (Stream-N + ReLU + B in regs) | 0.0924 | 426.1270 |
+
+The PM sampling timeline for the fully optimized kernel is shown below:
+
+![Stream-N + fused ReLU + B in registers PM sampling: SM Tensor Pipe Throughput, active warps per SMSP, and active SMs over time.](figures/pm_sampling_K16_v2_optimized.png)
 
 [^compiler-backends]: There may be compiler backends in the PyTorch universe that can fuse this into an efficient kernel. I am merely using this particular result as a motivation for writing our own kernel.
 

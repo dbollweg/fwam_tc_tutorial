@@ -221,7 +221,6 @@ def triton_kernel_bf16_stream_N(
                                       mask=mask_m, other=0.0, cache_modifier=".cg")
                 tl.store(Y_ptr + offsets_m, result, mask=mask_m)
 
-                tl.debug_barrier()
                 tl.store(Counter_ptr + tile_m, 0)
         work += last_n - first_n
 
