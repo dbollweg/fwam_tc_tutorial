@@ -14,16 +14,16 @@ Compiling the plain torch expression of this computation results in epilogue fus
 By writing a simple Triton kernel which fuses these two matmuls into a single kernel and avoids writing the [M,N] intermediate matrix to GPU memory, we can push arithmetic intensity high enough to make use of tensor cores. 
 
 The baseline kernel included in kernel_bench.py uses BF16 tensor core instructions and already achieves quite a respectable improvement over torch within less than 20 lines of Triton kernel code. 
-Benchmarked on an RTX Pro 6000 Blackwell GPU, we get the following result:
+Benchmarked with Triton 3.9 on an RTX Pro 6000 Blackwell GPU, we get the following result:
 
 | Implementation | Average (ms) | TFLOP/s |
 | :--- | ---: | ---: |
-| PyTorch | 6.6268 | 5.9411 |
-| PyTorch (compiled) | 3.4488 | 11.4160 |
-| Triton (baseline) | 0.1100 | 357.9578 |
+| PyTorch | 6.6237 | 5.9439 |
+| PyTorch (compiled) | 3.4436 | 11.4331 |
+| Triton (baseline) | 0.1078 | 365.0958 |
 
 ## Further optimizations
-While the baseline Triton result is nice, 357 TFLOP/s is still far from optimal. The specsheet promises 500 TFLOP/s for the RTX Pro 6000 Blackwell (Workstation edition) and while we cannot hit exactly that, we can certainly squeeze more out this kernel. I'm gathering a few more optimizations here that are a little too detailed to include in the talk itself for anyone who may be interested.
+While the baseline Triton result is nice, 365 TFLOP/s is still far from optimal. The spec sheet promises 500 TFLOP/s for the RTX Pro 6000 Blackwell (Workstation edition) and while we cannot hit exactly that, we can certainly squeeze more out this kernel. I'm gathering a few more optimizations here that are a little too detailed to include in the talk itself for anyone who may be interested.
 
 ### Adapting Stream-K
 The first issue we can address is that of better load balancing. Profiling our kernel with nsight-compute and looking at the PM sampling data, we see a tail where many of the GPUs streaming-multiprocessors (SMs) are sitting idle. This is known as "wave quantization":
@@ -31,7 +31,7 @@ When the thread-block count is not divisible by the number of streaming multipro
 we end up with a partial "wave" of work at the end of the kernel's lifetime 
 during which the GPU is underutilized.
 
-![Baseline Triton PM sampling: Tensor Core utilization, active warps per SMSP, and active SMs over time.](figures/pm_sampling_K16_v2_baseline.png)
+![Baseline Triton 3.9 PM sampling: SM Tensor Pipe Throughput, active warps per SMSP, and active SMs over time.](figures/pm_sampling_K16_triton39_baseline.png)
 
 We fix this by adapting the Stream-K idea.[^stream-k]
 
@@ -50,7 +50,7 @@ With this method, we now achieve:
 
 | Implementation | Average (ms) | TFLOP/s |
 | :--- | ---: | ---: |
-| Triton (Stream-N) | 0.0983 | 400.5142 |
+| Triton (Stream-N) | 0.0964 | 408.3884 |
 
 ### Fusing ReLU and type conversion
 
@@ -80,7 +80,7 @@ gives us the following improvement:
 
 | Implementation | Average (ms) | TFLOP/s |
 | :--- | ---: | ---: |
-| Triton (Stream-N + ReLU) | 0.0931 | 422.8930 |
+| Triton (Stream-N + ReLU) | 0.0909 | 432.8965 |
 
 We can also get this fusion in SASS by explicitly enabling NaN propagation:
 
@@ -100,14 +100,14 @@ Lastly, we notice that the B tile, which is re-used across an entire N loop, end
 $L__BB0_7: // Inner N loop
     // ... pipeline bookkeeping and loads of the current A and C tiles ...
     // Reload the same B tile from shared memory on every iteration.
-    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r217, %r218, %r219, %r220}, [%r22];
-    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r269, %r270, %r271, %r272}, [%r23];
-    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r305, %r306, %r307, %r308}, [%r24];
-    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r341, %r342, %r343, %r344}, [%r25];
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r220, %r221, %r222, %r223}, [%r23];
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r272, %r273, %r274, %r275}, [%r24];
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r308, %r309, %r310, %r311}, [%r25];
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r344, %r345, %r346, %r347}, [%r26];
     // ... initialize the accumulators ...
     mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32
-        {%r213, %r214, %r215, %r216}, {%r217, %r218, %r219, %r220},
-        {%r221, %r222}, {%r213, %r214, %r215, %r216};
+        {%r216, %r217, %r218, %r219}, {%r220, %r221, %r222, %r223},
+        {%r224, %r225}, {%r216, %r217, %r218, %r219};
     // ... remaining matrix operations, prefetching, and loop bookkeeping ...
     @%p17 bra $L__BB0_7;
 ```
@@ -125,16 +125,16 @@ With this change, the B tile is loaded into registers before the N loop and reus
 
 | Implementation | Average (ms) | TFLOP/s |
 | :--- | ---: | ---: |
-| PyTorch | 6.6268 | 5.9411 |
-| PyTorch (compiled) | 3.4488 | 11.4160 |
-| Triton (baseline) | 0.1100 | 357.9578 |
-| Triton (Stream-N) | 0.0983 | 400.5142 |
-| Triton (Stream-N + ReLU) | 0.0931 | 422.8930 |
-| Triton (Stream-N + ReLU + B in regs) | 0.0924 | 426.1270 |
+| PyTorch | 6.6237 | 5.9439 |
+| PyTorch (compiled) | 3.4436 | 11.4331 |
+| Triton (baseline) | 0.1078 | 365.0958 |
+| Triton (Stream-N) | 0.0964 | 408.3884 |
+| Triton (Stream-N + ReLU) | 0.0909 | 432.8965 |
+| Triton (Stream-N + ReLU + B in regs) | 0.0902 | 436.4345 |
 
 The PM sampling timeline for the fully optimized kernel is shown below:
 
-![Stream-N + fused ReLU + B in registers PM sampling: SM Tensor Pipe Throughput, active warps per SMSP, and active SMs over time.](figures/pm_sampling_K16_v2_optimized.png)
+![Stream-N + fused ReLU + B in registers with Triton 3.9 PM sampling: SM Tensor Pipe Throughput, active warps per SMSP, and active SMs over time.](figures/pm_sampling_K16_triton39_optimized.png)
 
 [^compiler-backends]: There may be compiler backends in the PyTorch universe that can fuse this into an efficient kernel. I am merely using this particular result as a motivation for writing our own kernel.
 

@@ -201,7 +201,6 @@ def triton_kernel_bf16_stream_N(
             tl.store(Partial_ptr + slot * BM * BK + scratch_offsets, y,
                      mask=mask_m, cache_modifier=".cg")
 
-            tl.debug_barrier()
             arrived = tl.atomic_add(Counter_ptr + tile_m, 1,
                                     sem="acq_rel", scope="gpu")
 
