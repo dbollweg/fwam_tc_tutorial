@@ -16,7 +16,7 @@ In both eager and compiled mode, PyTorch performs this computation with two matr
 
 By writing a simple Triton kernel which fuses these two matrix multiplications into a single kernel and avoids writing the [M,N] intermediate matrix to GPU memory, we can push arithmetic intensity high enough to make use of tensor cores. 
 
-Use the BF16 baseline in [kernel_bench.py](kernel_bench.py) as a reference for the exercises below. Its results and further optimizations are discussed in the [BF16 optimizations](#bf16-optimizatios).
+Use the BF16 baseline in [kernel_bench.py](kernel_bench.py) as a reference for the exercises below. Its results and further optimizations are discussed in the [BF16 optimizations](#bf16-optimizations) section.
 
 ## Exercises
 
