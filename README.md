@@ -130,9 +130,9 @@ s = tl.maximum(s, 0.0).to(tl.bfloat16, fp_downcast_rounding="rtne")
 y += tl.dot(s, c, out_dtype=tl.float32)
 ```
 
-We see a long section of `mma.sync` instructions corresponding to the first `tl.dot`, followed by a pattern of 2 `max` and one `cvt.rn` instruction. This is followed by the `mma.sync` instructions of our second `tl.dot` call. PTXAS interleaves these three phases to the best of its ability, but we still have to perform a lot of `FMNMX` instructions in between mma instructions which may be holding us back. To check this yourself, use the `--ptx-dir` and `--sass-dir` options which dump the kernel code for you to read.
+We see a long section of `mma.sync` instructions corresponding to the first `tl.dot`, followed by a repeating pattern of 2 `max` and one `cvt.rn` instruction. This is followed by the `mma.sync` instructions of our second `tl.dot` call. PTXAS interleaves these three phases to the best of its ability, but we still have to perform a lot of `FMNMX` instructions in between mma instructions which may be holding our Tensor Cores back. To check this yourself without going through Nsight Compute, use the `--ptx-dir` and `--sass-dir` options which dump the kernel code for you to read.
 
-Reading NVIDIA's [PTX documentation](https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cvt) for the `cvt` instruction, you may stumble upon the `{.relu}` modifier. This lets us create this gem: `cvt.rn.relu.bf16x2.f32`. It converts two FP32 values to BF16 and applies ReLU in the same instruction, which previously took us three instructions! Replacing the `tl.maximum` call with inline PTX
+Reading NVIDIA's [PTX documentation](https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cvt) for the `cvt` instruction, you may stumble upon the `{.relu}` modifier. This lets us create this gem: `cvt.rn.relu.bf16x2.f32`. It converts two FP32 values to BF16 and applies ReLU in the same instruction, which previously took us three! Replacing the `tl.maximum` call and conversion with inline PTX
 
 ```python
 s = tl.inline_asm_elementwise(
@@ -156,7 +156,7 @@ s = tl.maximum(s, 0.0, propagate_nan=tl.PropagateNan.ALL).to(
 )
 ```
 
-By default, `tl.maximum(NaN, 0.0)` returns zero, while `cvt.rn.relu` preserves NaNs. Setting `propagate_nan=tl.PropagateNan.ALL` makes these match. Triton still emits separate maximum and conversion instructions in PTX, but PTXAS can combine them into `F2FP.RELU.BF16.F32.PACK_AB` in SASS. We keep the inline PTX here to request the fused operation explicitly instead of relying on PTXAS.
+By default, `tl.maximum(NaN, 0.0)` returns zero, while `cvt.rn.relu` preserves NaNs. Setting `propagate_nan=tl.PropagateNan.ALL` matches their NaN behavior. Triton still emits separate maximum and conversion instructions in PTX, but PTXAS can combine them into `F2FP.RELU.BF16.F32.PACK_AB` in SASS. Since PTXAS is largely a black box, we keep the inline PTX here to be explicit.
 
 ### Keeping B in registers
 
