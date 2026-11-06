@@ -1,5 +1,8 @@
 # FWAM Tensor Core programming tutorial
+
 This repo contains the Triton benchmark and kernel code from my talk "Tensor Cores for Scientific Computing: Performance, Precision and Programming" at the Flatiron-wide Autumn Meeting Nov 12, 2026.
+
+[Exercises](#exercises) · [BF16 optimizations](#bf16-optimizations)
 
 The example used in that talk to give an introduction to Tensor Core programming is the following computation:
 
@@ -13,14 +16,7 @@ PyTorch (both eager and compiled) performs this computation with two matrix mult
 
 By writing a simple Triton kernel which fuses these two matrix multiplications into a single kernel and avoids writing the [M,N] intermediate matrix to GPU memory, we can push arithmetic intensity high enough to make use of tensor cores. 
 
-The baseline kernel included in kernel_bench.py uses BF16 tensor core instructions and already achieves quite a respectable improvement over PyTorch within less than 20 lines of Triton kernel code. 
-Benchmarked with Triton 3.9 on an RTX Pro 6000 Blackwell GPU, we get the following result:
-
-| Implementation | Average (ms) | TFLOP/s |
-| :--- | ---: | ---: |
-| PyTorch | 6.6237 | 5.9439 |
-| PyTorch (compiled) | 3.4436 | 11.4331 |
-| Triton (baseline) | 0.1078 | 365.0958 |
+Use the BF16 baseline in [kernel_bench.py](kernel_bench.py) as a reference for the exercises below. Its results and further optimizations are discussed in the [BF16 optimizations](#bf16-optimizatios).
 
 ## Exercises
 
@@ -82,8 +78,18 @@ This generates a `.ncu-rep` report file that you can download and view on your l
    - Every tile of `B` uses the same `A` and `C`. Can you reduce the cost of converting `A` and `C` to TF32, maybe combined with a solution to the issue hinted at above?
    
 
-## Further optimizations for BF16
-While the baseline Triton result is nice, 365 TFLOP/s is still far from optimal. The spec sheet promises 500 TFLOP/s for the RTX Pro 6000 Blackwell (Workstation edition) and while we cannot hit exactly that, we can certainly squeeze more out this kernel. I'm gathering a few more optimizations here that are a little too detailed to include in the talk itself for anyone who may be interested.
+## BF16 optimizations
+
+The baseline kernel included in [kernel_bench.py](kernel_bench.py) uses BF16 tensor core instructions and already achieves quite a respectable improvement over PyTorch within less than 20 lines of Triton kernel code.
+Benchmarked with Triton 3.9 on an RTX Pro 6000 Blackwell GPU, we get the following result:
+
+| Implementation | Average (ms) | TFLOP/s |
+| :--- | ---: | ---: |
+| PyTorch | 6.6237 | 5.9439 |
+| PyTorch (compiled) | 3.4436 | 11.4331 |
+| Triton (baseline) | 0.1078 | 365.0958 |
+
+While the baseline Triton result is good, 365 TFLOP/s is still far from optimal. The spec sheet promises 500 TFLOP/s for the RTX Pro 6000 Blackwell (Workstation edition) and while we cannot hit exactly that, we can certainly squeeze more out this kernel. I'm gathering a few more optimizations here that are a little too detailed to include in the talk itself for anyone who may be interested.
 
 ### Adapting Stream-K
 The first issue we can address is that of better load balancing. Profiling our kernel with nsight-compute and looking at the PM sampling data, we see a tail where many of the GPUs streaming-multiprocessors (SMs) are sitting idle. This is known as "wave quantization":
