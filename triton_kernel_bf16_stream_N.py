@@ -117,6 +117,7 @@ class _StreamNScheduledKernel(KernelInterface):
         for num_stages in (2, 3)
     ],
     key=["M", "N", "K", "NUM_SMS", "FUSE_RELU", "KEEP_B_IN_REGISTERS"],
+    cache_results=True,
 )
 @_StreamNScheduledKernel
 @triton.jit(do_not_specialize=["STREAM_TILES", "STREAM_PROGRAMS"],

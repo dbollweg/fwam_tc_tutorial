@@ -9,11 +9,11 @@ $$
 
 with tall-and-skinny matrices $B \in \mathbb{R}^{M \times K}$ and $A, C \in \mathbb{R}^{N \times K}$, where $M = 250000$, $N = 2500$, and $K = 16$.
 
-Compiling the plain torch expression of this computation results in epilogue fusion of the ReLU into the first matmul, but the two matmuls remain as separate kernels, severely reducing arithmetic intensity to the point that our FLOP/s throughput is limited entirely by memory bandwidth.[^compiler-backends]
+PyTorch (both eager and compiled) performs this computation with two matrix multiplication kernels, severely reducing arithmetic intensity to the point that our FLOP/s throughput is limited entirely by memory bandwidth.[^compiler-backends]
 
-By writing a simple Triton kernel which fuses these two matmuls into a single kernel and avoids writing the [M,N] intermediate matrix to GPU memory, we can push arithmetic intensity high enough to make use of tensor cores. 
+By writing a simple Triton kernel which fuses these two matrix multiplications into a single kernel and avoids writing the [M,N] intermediate matrix to GPU memory, we can push arithmetic intensity high enough to make use of tensor cores. 
 
-The baseline kernel included in kernel_bench.py uses BF16 tensor core instructions and already achieves quite a respectable improvement over torch within less than 20 lines of Triton kernel code. 
+The baseline kernel included in kernel_bench.py uses BF16 tensor core instructions and already achieves quite a respectable improvement over PyTorch within less than 20 lines of Triton kernel code. 
 Benchmarked with Triton 3.9 on an RTX Pro 6000 Blackwell GPU, we get the following result:
 
 | Implementation | Average (ms) | TFLOP/s |
@@ -22,7 +22,67 @@ Benchmarked with Triton 3.9 on an RTX Pro 6000 Blackwell GPU, we get the followi
 | PyTorch (compiled) | 3.4436 | 11.4331 |
 | Triton (baseline) | 0.1078 | 365.0958 |
 
-## Further optimizations
+## Exercises
+
+1. Grab an RTX Pro 6000 Blackwell on our cluster (Slurm constraint `-C rtxblackwell`), load the modules in [modules.sh](modules.sh), create a virtual environment with the packages from [requirements.txt](requirements.txt) and activate it, then run the [BF16 benchmark](kernel_bench.py) yourself.[^cluster-power-limit]
+
+   From a cluster node:
+
+   ```bash
+   source modules.sh
+   python -m venv .venv
+   source .venv/bin/activate
+   python -m pip install -r requirements.txt
+
+   python kernel_bench.py
+   ```
+
+2. Take a look at [kernel_tf32_exercise.py](kernel_tf32_exercise.py). It contains the
+   benchmark skeleton for computing $\mathrm{ReLU}(B A^{\mathsf{T}}) C$ using TF32
+   instead of BF16. Implement the missing Triton kernel using TF32 matrix multiplications.
+
+   For your first version, use the [BF16 baseline](kernel_bench.py) as a reference
+   and the provided `convert_to_tf32` helper to convert FP32 values to TF32.
+   For M=250000,N=2500 and K=16, you should be able to achieve a relative error compared to FP64 of about 4.2e-04 when rounding to TF32 correctly.
+
+   See the [`triton.language.dot` documentation](https://triton-lang.org/main/python-api/generated/triton.language.dot.html)
+   for the matrix multiplication options.
+
+   After implementing your kernel variant, run the benchmark:
+   ```bash
+   python kernel_tf32_exercise.py --K 16
+   ```
+
+3. What performance do you achieve with your first kernel version when using TF32? 
+   Profile the kernel with Nsight Compute, open its "Details" page in the GUI and answer the following questions: 
+   - Check the **Compute Workload Analysis**. What percentage of the aggregate Tensor Pipeline utilization do you achieve? 
+   - Check the **PM Sampling** section. How does this pipeline utilization vary over the lifetime of the kernel?
+   - Check the **Instruction Statistics**. What are your most frequently executed instructions and what do they do? 
+   - Switch to the **Source** page and explore how your Triton code translates into PTX and SASS.
+
+To capture one kernel invocation of each implementation with Nsight Compute, use `--profile-only`:
+
+```bash
+ncu --set full --profile-from-start off --nvtx --import-source yes -o bf16_K16 \
+    python kernel_bench.py --K 16 --profile-only
+
+ncu --set full --profile-from-start off --nvtx --import-source yes -o tf32_K16 \
+    python kernel_tf32_exercise.py --K 16 --profile-only
+```
+
+This generates a `.ncu-rep` report file that you can download and view on your local machine with the [NVIDIA Nsight Compute GUI](https://developer.nvidia.com/nsight-compute).
+
+
+4. Optimize the kernel to the best of your ability! For K=16, can you push past **180 TFLOP/s** on our cluster's RTX cards? How about **200 TFLOP/s**?
+   You may modify `kernel_launch` and the implementation(s) it invokes. Include all preparation work in your benchmark timings.
+
+   **Hints:**
+
+   - Take a close look at the `mma.sync` accumulator and operand layouts for [TF32](figures/mma_sync_tf32_layouts.pdf) and compare them to [BF16](figures/mma_sync_bf16_layouts.pdf). Do you notice an issue for our two consecutive `tl.dot` calls?
+   - Every tile of `B` uses the same `A` and `C`. Can you reduce the cost of converting `A` and `C` to TF32, maybe combined with a solution to the issue hinted at above?
+   
+
+## Further optimizations for BF16
 While the baseline Triton result is nice, 365 TFLOP/s is still far from optimal. The spec sheet promises 500 TFLOP/s for the RTX Pro 6000 Blackwell (Workstation edition) and while we cannot hit exactly that, we can certainly squeeze more out this kernel. I'm gathering a few more optimizations here that are a little too detailed to include in the talk itself for anyone who may be interested.
 
 ### Adapting Stream-K
@@ -56,7 +116,7 @@ With this method, we now achieve:
 
 With better load-balancing we have (mostly) removed the low utilization tail at the end of the kernel's lifetime. We now sit at around 93% Tensor Core throughput during the bulk of the kernels lifetime.
 
-If we look at the PTX generated by our core computation:
+If we look at the [PTX](ptx/triton_kernel_bf16_stream_N_K16.ptx) generated by our core computation:
 
 ```python
 s = tl.dot(b, tl.trans(a), out_dtype=tl.float32)
@@ -137,5 +197,7 @@ The PM sampling timeline for the fully optimized kernel is shown below:
 ![Stream-N + fused ReLU + B in registers with Triton 3.9 PM sampling: SM Tensor Pipe Throughput, active warps per SMSP, and active SMs over time.](figures/pm_sampling_K16_triton39_optimized.png)
 
 [^compiler-backends]: There may be compiler backends in the PyTorch universe that can fuse this into an efficient kernel. I am merely using this particular result as a motivation for writing our own kernel.
+
+[^cluster-power-limit]: You may see lower results on the cluster nodes as we have set the GPUs to have a reduced power limit compared to the Workstation edition.
 
 [^stream-k]: Muhammad Osama, Duane Merrill, Cris Cecka, Michael Garland, and John D. Owens. 2023. [Stream-K: Work-Centric Parallel Decomposition for Dense Matrix-Matrix Multiplication on the GPU](https://doi.org/10.1145/3572848.3577479). In *Proceedings of the 28th ACM SIGPLAN Annual Symposium on Principles and Practice of Parallel Programming (PPoPP '23)*. Association for Computing Machinery, New York, NY, USA, 429–431.

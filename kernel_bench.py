@@ -23,7 +23,8 @@ from triton_kernel_bf16_stream_N import (
             for num_warps in (4,8)
             for num_stages in (1,2,3)
         ],
-        key=["M", "N", "K"]
+        key=["M", "N", "K"],
+        cache_results=True,
 )
 @triton.jit
 def triton_kernel(
@@ -77,7 +78,7 @@ def kernel_launch(B, A, C, *, ptx_dir=None, sass_dir=None):
                 continue
             directory = Path(directory)
             directory.mkdir(parents=True, exist_ok=True)
-            path = directory / f"triton_kernel_K{K}.{fmt}"
+            path = directory / f"triton_kernel_bf16_K{K}.{fmt}"
             path.write_text(compiled.asm[fmt], encoding="utf-8")
             print(f"Saved {fmt.upper()}: {path}")
         print(f"Tuned config: {triton_kernel.best_config}")
@@ -151,6 +152,21 @@ def run_benchmark(args, K, implementations):
         print(f"{name:<{name_width}} {ms:>14.4f} {ms_to_tflops(M, N, K, ms):>14.4f}")
 
 
+def run_profile(args, K, implementations):
+    for name, fn in implementations:
+        fn()
+        torch.cuda.synchronize()
+
+        torch.cuda.profiler.start()
+        try:
+            with torch.cuda.nvtx.range(f"M={args.M}, N={args.N}, K={K}: {name}"):
+                fn()
+                torch.cuda.synchronize()
+        finally:
+            torch.cuda.profiler.stop()
+        time.sleep(args.cooldown_ms / 1000)
+
+
 def compute_error(name, result, reference):
     delta = result - reference
     relative_error = torch.linalg.vector_norm(delta)/torch.linalg.vector_norm(reference)
@@ -176,6 +192,9 @@ def main():
     parser.add_argument("--iterations", "--iters", type=int, default=100,
                         help="timed iterations per implementation "
                              "(default: %(default)s)")
+    parser.add_argument("--profile-only", action="store_true",
+                        help="profile one invocation per implementation with NVTX ranges, "
+                             "skipping timings; use ncu --profile-from-start off --nvtx")
     parser.add_argument("--ptx-dir", type=Path, metavar="DIR",
                         help="save each tuned Triton kernel's PTX in DIR")
     parser.add_argument("--sass-dir", type=Path, metavar="DIR",
@@ -185,7 +204,7 @@ def main():
 
     if args.M <= 0 or args.N <= 0 or any(K <= 0 for K in args.K):
         parser.error("M, N, and K must be positive")
-    if args.warmup < 0 or args.iterations <= 0:
+    if args.warmup < 0 or (not args.profile_only and args.iterations <= 0):
         parser.error("warmup must be nonnegative and iterations must be positive")
     if args.cooldown_ms < 0:
         parser.error("cooldown-ms must be nonnegative")
@@ -224,7 +243,10 @@ def main():
             # for name, fn in implementations:
             #     compute_error(name, fn(), expected)
 
-            run_benchmark(args, K, implementations)
+            if args.profile_only:
+                run_profile(args, K, implementations)
+            else:
+                run_benchmark(args, K, implementations)
             if args.ptx_dir is not None or args.sass_dir is not None:
                 for _, fn in candidates:
                     fn(ptx_dir=args.ptx_dir, sass_dir=args.sass_dir)
