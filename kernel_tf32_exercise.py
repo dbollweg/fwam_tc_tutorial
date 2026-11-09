@@ -45,7 +45,7 @@ def kernel_launch(B, A, C, *, ptx_dir=None, sass_dir=None):
     M, _ = B.shape
     Y = torch.empty((M,K), device=A.device, dtype=torch.float32)
 
-    #round to nearest multiple of Tensor Core instruction K size - 8 for TF32, 16 for BF16
+    #round K up to a power of two, with minimum of Tensor Core instruction K size - 8 for TF32, 16 for BF16
     BK = max(8, triton.next_power_of_2(K))
 
     #1D program grid along M with a single program covering BM rows
